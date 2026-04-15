@@ -1,5 +1,5 @@
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
-exports.version = 4
+exports.version = 5
 exports.apiRequired = 12.97
 exports.repo = "Feuerswut/hfs-tarpit"
 
@@ -128,7 +128,7 @@ exports.config = {
                 type: 'net_mask',
                 label: 'IP/CIDR',
                 helperText: 'e.g., 192.168.1.0/24 or 10.0.0.5',
-                $width: 8
+                $width: 4
             },
             enabled: {
                 type: 'boolean',
@@ -142,11 +142,81 @@ exports.config = {
 
 exports.init = api => {
     const { _, misc } = api
+    const { Readable, PassThrough } = require('stream')
 
-    // Store for honeypot-trapped IPs
-    const honeypotIPs = new Map() // { ip: { timer: timeoutId, startTime: timestamp } }
+    // -------------------------------------------------------------------------
+    // Stream pool — hard cap of 20 concurrent tarpit/honeypot streams.
+    // Map preserves insertion order so the first entry is always the oldest.
+    // Each slot: { kill(), timeoutTimer, startTime, ip }
+    // -------------------------------------------------------------------------
+    const MAX_STREAMS = 20
+    const STREAM_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+    const streamPool = new Map()
+    let nextStreamId = 0
 
-    // Helper function to match wildcards
+    // Register a new stream. If the pool is full, kills the oldest first.
+    // killFn must synchronously stop the stream loop and destroy/end the stream.
+    // Returns the assigned stream id (pass to releaseStream on natural close).
+    function registerStream(ip, killFn) {
+        if (streamPool.size >= MAX_STREAMS) {
+            const [oldestId, oldest] = streamPool.entries().next().value
+            api.log(`tarpit: pool full (${MAX_STREAMS}), evicting oldest stream id=${oldestId} ip=${oldest.ip}`)
+            oldest.kill()
+            releaseStream(oldestId) // force-remove; 'close' will be a no-op
+        }
+
+        const id = ++nextStreamId
+        const timeoutTimer = setTimeout(() => {
+            const entry = streamPool.get(id)
+            if (!entry) return
+            api.log(`tarpit: stream id=${id} ip=${entry.ip} killed after 10-minute timeout`)
+            entry.kill()
+            releaseStream(id)
+        }, STREAM_TIMEOUT_MS)
+
+        streamPool.set(id, { kill: killFn, timeoutTimer, startTime: Date.now(), ip })
+        api.log(`tarpit: stream id=${id} registered for ip=${ip} (pool size=${streamPool.size})`)
+        return id
+    }
+
+    // Release a slot. Safe to call multiple times for the same id.
+    function releaseStream(id) {
+        const entry = streamPool.get(id)
+        if (!entry) return
+        clearTimeout(entry.timeoutTimer)
+        streamPool.delete(id)
+        api.log(`tarpit: stream id=${id} released (pool size=${streamPool.size})`)
+    }
+
+    // -------------------------------------------------------------------------
+    // Honeypot IP tracking
+    // -------------------------------------------------------------------------
+    const honeypotIPs = new Map() // ip -> { timer, startTime }
+
+    function activateHoneypot(ip, duration, logMatches) {
+        if (honeypotIPs.has(ip)) {
+            clearTimeout(honeypotIPs.get(ip).timer)
+        }
+        const timer = setTimeout(() => {
+            honeypotIPs.delete(ip)
+            if (logMatches) api.log(`Honeypot deactivated for ${ip} (timeout)`)
+        }, duration * 1000)
+
+        honeypotIPs.set(ip, { timer, startTime: Date.now() })
+        if (logMatches) api.log(`Honeypot activated for ${ip} (duration: ${duration}s)`)
+    }
+
+    function resetHoneypotTimer(ip, duration) {
+        if (!honeypotIPs.has(ip)) return
+        const entry = honeypotIPs.get(ip)
+        clearTimeout(entry.timer)
+        entry.timer = setTimeout(() => { honeypotIPs.delete(ip) }, duration * 1000)
+        entry.startTime = Date.now()
+    }
+
+    // -------------------------------------------------------------------------
+    // Wildcard / whitelist helpers
+    // -------------------------------------------------------------------------
     function matchesPattern(str, pattern) {
         if (!str || !pattern) return false
         const regexPattern = pattern
@@ -156,138 +226,176 @@ exports.init = api => {
         return new RegExp('^' + regexPattern + '$', 'i').test(str)
     }
 
-    // Helper function to check if IP is whitelisted
     function isWhitelisted(ip, whitelist) {
         if (!whitelist || whitelist.length === 0) return false
-        
         for (const entry of whitelist) {
-            if (!entry.enabled) continue
-            const mask = entry.ip
-            if (!mask) continue
-            
+            if (!entry.enabled || !entry.ip) continue
             try {
-                if (misc.ipMatch(ip, mask)) {
-                    return true
-                }
+                if (misc.ipMatch(ip, entry.ip)) return true
             } catch (e) {
-                api.log('Invalid IP mask:', mask, e.message)
+                api.log('Invalid IP mask:', entry.ip, e.message)
             }
         }
         return false
     }
 
-    // Add IP to honeypot
-    function activateHoneypot(ip, duration, logMatches) {
-        // Clear existing timer if any
-        if (honeypotIPs.has(ip)) {
-            clearTimeout(honeypotIPs.get(ip).timer)
-        }
+    // -------------------------------------------------------------------------
+    // Stream factories — all go through registerStream / releaseStream
+    // -------------------------------------------------------------------------
 
-        // Set new timer
-        const timer = setTimeout(() => {
-            honeypotIPs.delete(ip)
-            if (logMatches) {
-                api.log(`Honeypot deactivated for ${ip} (timeout)`)
-            }
-        }, duration * 1000)
-
-        honeypotIPs.set(ip, {
-            timer: timer,
-            startTime: Date.now()
-        })
-
-        if (logMatches) {
-            api.log(`Honeypot activated for ${ip} (duration: ${duration}s)`)
-        }
-    }
-
-    // Reset honeypot timer for IP
-    function resetHoneypotTimer(ip, duration) {
-        if (honeypotIPs.has(ip)) {
-            const entry = honeypotIPs.get(ip)
-            clearTimeout(entry.timer)
-            
-            const timer = setTimeout(() => {
-                honeypotIPs.delete(ip)
-            }, duration * 1000)
-            
-            entry.timer = timer
-            entry.startTime = Date.now()
-        }
-    }
-
-    // Create infinite "a" stream
-    function createHoneypotStream(ctx, speed) {
-        const { Readable } = require('stream')
-        const stream = new Readable({
-            read() {}
-        })
-
-        const bytesPerSecond = speed || 0.1
-        // Send in 64-byte chunks to reduce the number of active timers ~64x
+    // Infinite 'a' stream for honeypot connections
+    function createHoneypotStream(ip, speed) {
+        const stream = new Readable({ read() {} })
         const CHUNK_SIZE = 64
-        const chunkDelay = (1000 / bytesPerSecond) * CHUNK_SIZE
-        const chunk = Buffer.alloc(CHUNK_SIZE, 'a'.charCodeAt(0))
-
+        const chunkDelay = (1000 / (speed || 0.1)) * CHUNK_SIZE
+        const chunk = Buffer.alloc(CHUNK_SIZE, 0x61) // 'a'
         let stopped = false
-        stream.on('close', () => { stopped = true; stream.push(null) })
+
+        const kill = () => {
+            stopped = true
+            stream.destroy()
+        }
+
+        const id = registerStream(ip, kill)
+
+        stream.on('close', () => {
+            stopped = true
+            releaseStream(id)
+        })
 
         const sendChunk = () => {
-            if (stopped || ctx.isAborted()) {
-                stream.push(null)
-                return
-            }
+            if (stopped) return
             stream.push(chunk)
             setTimeout(sendChunk, chunkDelay)
         }
-
         sendChunk()
+
         return stream
     }
 
-    // Middleware to intercept and slow down responses
+    // Throttled stream for a finite string/Buffer body
+    function createSlowBufferStream(ip, buffer, speed) {
+        const stream = new Readable({ read() {} })
+        const CHUNK_SIZE = 64
+        const chunkDelay = (1000 / (speed || 100)) * CHUNK_SIZE
+        let offset = 0
+        let stopped = false
+
+        const kill = () => {
+            stopped = true
+            stream.destroy()
+        }
+
+        const id = registerStream(ip, kill)
+
+        stream.on('close', () => {
+            stopped = true
+            releaseStream(id)
+        })
+
+        const sendChunk = () => {
+            if (stopped) {
+                stream.push(null)
+                return
+            }
+            if (offset >= buffer.length) {
+                stream.push(null)
+                return
+            }
+            const end = Math.min(offset + CHUNK_SIZE, buffer.length)
+            stream.push(buffer.slice(offset, end))
+            offset = end
+            setTimeout(sendChunk, chunkDelay)
+        }
+        sendChunk()
+
+        return stream
+    }
+
+    // Throttled PassThrough wrapper for a streaming body
+    function createSlowPassThrough(ip, originalStream, speed) {
+        const throttle = new PassThrough()
+        const CHUNK_SIZE = 64
+        const chunkDelay = (1000 / (speed || 100)) * CHUNK_SIZE
+        let stopped = false
+
+        const kill = () => {
+            stopped = true
+            throttle.destroy()
+        }
+
+        const id = registerStream(ip, kill)
+
+        throttle.on('close', () => {
+            stopped = true
+            releaseStream(id)
+        })
+
+        originalStream.on('data', chunk => {
+            originalStream.pause()
+            let offset = 0
+
+            const sendChunk = () => {
+                if (stopped) {
+                    throttle.destroy()
+                    return
+                }
+                if (offset >= chunk.length) {
+                    originalStream.resume()
+                    return
+                }
+                const end = Math.min(offset + CHUNK_SIZE, chunk.length)
+                throttle.write(chunk.slice(offset, end))
+                offset = end
+                setTimeout(sendChunk, chunkDelay)
+            }
+            sendChunk()
+        })
+
+        originalStream.on('end', () => { if (!stopped) throttle.end() })
+        originalStream.on('error', err => throttle.destroy(err))
+
+        return throttle
+    }
+
+    // -------------------------------------------------------------------------
+    // Middleware
+    // -------------------------------------------------------------------------
     exports.middleware = ctx => {
         const config = {
-            enabled: api.getConfig('enabled'),
-            speed: api.getConfig('speed'),
-            honeypotSpeed: api.getConfig('honeypotSpeed'),
-            honeypotDuration: api.getConfig('honeypotDuration'),
-            userAgentMasks: api.getConfig('userAgentMasks'),
-            urlMasks: api.getConfig('urlMasks'),
-            responseCodes: api.getConfig('responseCodes'),
-            logMatches: api.getConfig('logMatches'),
-            whitelistIPs: api.getConfig('whitelistIPs')
+            enabled:         api.getConfig('enabled'),
+            speed:           api.getConfig('speed'),
+            honeypotSpeed:   api.getConfig('honeypotSpeed'),
+            honeypotDuration:api.getConfig('honeypotDuration'),
+            userAgentMasks:  api.getConfig('userAgentMasks'),
+            urlMasks:        api.getConfig('urlMasks'),
+            responseCodes:   api.getConfig('responseCodes'),
+            logMatches:      api.getConfig('logMatches'),
+            whitelistIPs:    api.getConfig('whitelistIPs')
         }
 
         if (!config.enabled) return
 
         const clientIP = ctx.ip
-        
-        // Check whitelist first
-        if (isWhitelisted(clientIP, config.whitelistIPs)) {
-            return
-        }
 
-        // Check if IP is in honeypot
+        if (isWhitelisted(clientIP, config.whitelistIPs)) return
+
+        // ---- Honeypot: IP already trapped ----
         if (honeypotIPs.has(clientIP)) {
             resetHoneypotTimer(clientIP, config.honeypotDuration)
-            
-            if (config.logMatches) {
-                api.log(`Honeypot response sent to ${clientIP} (timer reset)`)
-            }
+            if (config.logMatches) api.log(`Honeypot response sent to ${clientIP} (timer reset)`)
 
-            // Send infinite "a" stream
             ctx.status = 200
             ctx.type = 'text/plain'
-            ctx.body = createHoneypotStream(ctx, config.honeypotSpeed)
-            return true // Stop further processing
+            ctx.body = createHoneypotStream(clientIP, config.honeypotSpeed)
+            return true
         }
 
         let shouldTarpit = false
         let shouldActivateHoneypot = false
         let reason = ''
 
-        // Check User Agent
+        // ---- User-Agent check ----
         const userAgent = ctx.get('user-agent') || ''
         if (config.userAgentMasks && config.userAgentMasks.length > 0) {
             for (const mask of config.userAgentMasks) {
@@ -300,45 +408,36 @@ exports.init = api => {
             }
         }
 
-        // Check URL pattern
+        // ---- URL check ----
         if (!shouldTarpit && config.urlMasks && config.urlMasks.length > 0) {
-            const url = ctx.path
             for (const mask of config.urlMasks) {
                 if (!mask.enabled) continue
-                if (matchesPattern(url, mask.pattern)) {
+                if (matchesPattern(ctx.path, mask.pattern)) {
                     shouldTarpit = true
                     reason = `URL matches "${mask.pattern}"`
-                    
-                    // Check if this should activate honeypot
-                    if (mask.honeypot) {
-                        shouldActivateHoneypot = true
-                    }
+                    if (mask.honeypot) shouldActivateHoneypot = true
                     break
                 }
             }
         }
 
-        // Activate honeypot if needed
+        // ---- Honeypot activation ----
         if (shouldActivateHoneypot) {
             activateHoneypot(clientIP, config.honeypotDuration, config.logMatches)
-            
-            // Send infinite "a" stream immediately
             ctx.status = 200
             ctx.type = 'text/plain'
-            ctx.body = createHoneypotStream(ctx, config.honeypotSpeed)
-            return true // Stop further processing
+            ctx.body = createHoneypotStream(clientIP, config.honeypotSpeed)
+            return true
         }
 
-        // Return upstream function to check response code
+        // ---- Upstream: response-code check + body throttle ----
         return async () => {
-            // Check response code (only available in upstream)
             if (!shouldTarpit && config.responseCodes && config.responseCodes.length > 0) {
-                const statusCode = ctx.status
                 for (const codeEntry of config.responseCodes) {
                     if (!codeEntry.enabled) continue
-                    if (statusCode === codeEntry.code) {
+                    if (ctx.status === codeEntry.code) {
                         shouldTarpit = true
-                        reason = `Response code is ${statusCode}`
+                        reason = `Response code is ${ctx.status}`
                         break
                     }
                 }
@@ -346,108 +445,38 @@ exports.init = api => {
 
             if (!shouldTarpit) return
 
-            if (config.logMatches) {
-                api.log(`Tarpit activated for ${clientIP}: ${reason}`)
-            }
+            if (config.logMatches) api.log(`Tarpit activated for ${clientIP}: ${reason}`)
 
-            // Implement the tarpit
             const body = ctx.body
             if (!body) return
 
-            // Convert body to buffer if it's a string
-            let buffer
-            if (typeof body === 'string') {
-                buffer = Buffer.from(body)
-            } else if (Buffer.isBuffer(body)) {
-                buffer = body
+            if (typeof body === 'string' || Buffer.isBuffer(body)) {
+                const buf = Buffer.isBuffer(body) ? body : Buffer.from(body)
+                ctx.body = createSlowBufferStream(clientIP, buf, config.speed)
             } else if (body.pipe) {
-                // It's a stream - we'll handle this differently
-                const originalStream = body
-                const { PassThrough } = require('stream')
-                const throttle = new PassThrough()
-                
-                let bytesWritten = 0
-                const bytesPerSecond = config.speed || 100
-                const chunkDelay = 1000 / bytesPerSecond // ms per byte
-                
-                // Send in 64-byte chunks to reduce active timer count
-                const CHUNK_SIZE = 64
-                const adjustedDelay = chunkDelay * CHUNK_SIZE
-                let streamStopped = false
-                throttle.on('close', () => { streamStopped = true })
-
-                originalStream.on('data', chunk => {
-                    originalStream.pause()
-                    let offset = 0
-
-                    const sendChunk = () => {
-                        if (streamStopped || ctx.isAborted()) {
-                            throttle.end()
-                            return
-                        }
-                        if (offset < chunk.length) {
-                            const end = Math.min(offset + CHUNK_SIZE, chunk.length)
-                            throttle.write(chunk.slice(offset, end))
-                            bytesWritten += (end - offset)
-                            offset = end
-                            setTimeout(sendChunk, adjustedDelay)
-                        } else {
-                            originalStream.resume()
-                        }
-                    }
-
-                    sendChunk()
-                })
-                
-                originalStream.on('end', () => throttle.end())
-                originalStream.on('error', err => throttle.destroy(err))
-                
-                ctx.body = throttle
-                return
-            } else {
-                return // Can't handle this body type
+                ctx.body = createSlowPassThrough(clientIP, body, config.speed)
             }
-
-            // For string/buffer bodies, create a slow stream
-            const { Readable } = require('stream')
-            const slowStream = new Readable({
-                read() {}
-            })
-
-            const bytesPerSecond = config.speed || 100
-            const CHUNK_SIZE = 64
-            const chunkDelay = (1000 / bytesPerSecond) * CHUNK_SIZE // ms per chunk
-            let offset = 0
-            let slowStopped = false
-            slowStream.on('close', () => { slowStopped = true })
-
-            const sendChunk = () => {
-                if (slowStopped || ctx.isAborted()) {
-                    slowStream.push(null)
-                    return
-                }
-                if (offset < buffer.length) {
-                    const end = Math.min(offset + CHUNK_SIZE, buffer.length)
-                    slowStream.push(buffer.slice(offset, end))
-                    offset = end
-                    setTimeout(sendChunk, chunkDelay)
-                } else {
-                    slowStream.push(null) // End the stream
-                }
-            }
-
-            sendChunk()
-            ctx.body = slowStream
+            // all other body types pass through unchanged
         }
     }
 
+    // -------------------------------------------------------------------------
     // Cleanup on unload
+    // -------------------------------------------------------------------------
     exports.unload = () => {
+        // Kill every active stream
+        for (const [id, entry] of streamPool.entries()) {
+            entry.kill()
+            clearTimeout(entry.timeoutTimer)
+        }
+        streamPool.clear()
+
         // Clear all honeypot timers
-        for (const [ip, entry] of honeypotIPs.entries()) {
+        for (const [, entry] of honeypotIPs.entries()) {
             clearTimeout(entry.timer)
         }
         honeypotIPs.clear()
-        api.log('Tarpit plugin unloaded, all honeypot timers cleared')
+
+        api.log('Tarpit plugin unloaded, all streams and honeypot timers cleared')
     }
 }
