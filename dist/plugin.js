@@ -1,7 +1,8 @@
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
-exports.version = 3
+exports.version = 4
 exports.apiRequired = 12.97
-exports.repo = "feuerswut/hfs-tarpit"
+exports.repo = "Feuerswut/hfs-tarpit"
+
 
 exports.config = {
     enabled: {
@@ -223,18 +224,24 @@ exports.init = api => {
         })
 
         const bytesPerSecond = speed || 0.1
-        const chunkDelay = 1000 / bytesPerSecond
+        // Send in 64-byte chunks to reduce the number of active timers ~64x
+        const CHUNK_SIZE = 64
+        const chunkDelay = (1000 / bytesPerSecond) * CHUNK_SIZE
+        const chunk = Buffer.alloc(CHUNK_SIZE, 'a'.charCodeAt(0))
 
-        const sendByte = () => {
-            if (!ctx.isAborted()) {
-                stream.push(Buffer.from(['a'.charCodeAt(0)]))
-                setTimeout(sendByte, chunkDelay)
-            } else {
+        let stopped = false
+        stream.on('close', () => { stopped = true; stream.push(null) })
+
+        const sendChunk = () => {
+            if (stopped || ctx.isAborted()) {
                 stream.push(null)
+                return
             }
+            stream.push(chunk)
+            setTimeout(sendChunk, chunkDelay)
         }
 
-        sendByte()
+        sendChunk()
         return stream
     }
 
@@ -363,22 +370,33 @@ exports.init = api => {
                 const bytesPerSecond = config.speed || 100
                 const chunkDelay = 1000 / bytesPerSecond // ms per byte
                 
+                // Send in 64-byte chunks to reduce active timer count
+                const CHUNK_SIZE = 64
+                const adjustedDelay = chunkDelay * CHUNK_SIZE
+                let streamStopped = false
+                throttle.on('close', () => { streamStopped = true })
+
                 originalStream.on('data', chunk => {
                     originalStream.pause()
                     let offset = 0
-                    
-                    const sendByte = () => {
-                        if (offset < chunk.length && !ctx.isAborted()) {
-                            throttle.write(Buffer.from([chunk[offset]]))
-                            offset++
-                            bytesWritten++
-                            setTimeout(sendByte, chunkDelay)
+
+                    const sendChunk = () => {
+                        if (streamStopped || ctx.isAborted()) {
+                            throttle.end()
+                            return
+                        }
+                        if (offset < chunk.length) {
+                            const end = Math.min(offset + CHUNK_SIZE, chunk.length)
+                            throttle.write(chunk.slice(offset, end))
+                            bytesWritten += (end - offset)
+                            offset = end
+                            setTimeout(sendChunk, adjustedDelay)
                         } else {
                             originalStream.resume()
                         }
                     }
-                    
-                    sendByte()
+
+                    sendChunk()
                 })
                 
                 originalStream.on('end', () => throttle.end())
@@ -397,21 +415,28 @@ exports.init = api => {
             })
 
             const bytesPerSecond = config.speed || 100
-            const chunkDelay = 1000 / bytesPerSecond // milliseconds per byte
+            const CHUNK_SIZE = 64
+            const chunkDelay = (1000 / bytesPerSecond) * CHUNK_SIZE // ms per chunk
             let offset = 0
+            let slowStopped = false
+            slowStream.on('close', () => { slowStopped = true })
 
-            const sendByte = () => {
-                if (offset < buffer.length && !ctx.isAborted()) {
-                    slowStream.push(Buffer.from([buffer[offset]]))
-                    offset++
-                    setTimeout(sendByte, chunkDelay)
+            const sendChunk = () => {
+                if (slowStopped || ctx.isAborted()) {
+                    slowStream.push(null)
+                    return
                 }
-                else {
+                if (offset < buffer.length) {
+                    const end = Math.min(offset + CHUNK_SIZE, buffer.length)
+                    slowStream.push(buffer.slice(offset, end))
+                    offset = end
+                    setTimeout(sendChunk, chunkDelay)
+                } else {
                     slowStream.push(null) // End the stream
                 }
             }
 
-            sendByte()
+            sendChunk()
             ctx.body = slowStream
         }
     }
