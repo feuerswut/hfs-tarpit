@@ -1,8 +1,8 @@
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
 exports.version = 5
 exports.apiRequired = 12.97
-exports.repo = "Feuerswut/hfs-tarpit"
-
+exports.author = "feuerswut"
+exports.repo = "feuerswut/hfs-tarpit"
 
 exports.config = {
     enabled: {
