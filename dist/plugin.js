@@ -1,5 +1,5 @@
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
-exports.version = 6
+exports.version = 1.6
 exports.apiRequired = 12.97
 exports.author = "feuerswut"
 exports.repo = "feuerswut/hfs-tarpit"
@@ -143,7 +143,7 @@ exports.config = {
 exports.init = api => {
     const { _ } = api
     const { Readable, PassThrough } = require('stream')
-    const { Netmask } = api.require('netmask')
+
 
     // -------------------------------------------------------------------------
     // Stream pool — hard cap of 20 concurrent tarpit/honeypot streams.
@@ -227,12 +227,20 @@ exports.init = api => {
         return new RegExp('^' + regexPattern + '$', 'i').test(str)
     }
 
+    function ipToInt(str) {
+        return str.split('.').reduce((acc, octet) => ((acc << 8) + parseInt(octet, 10)) >>> 0, 0)
+    }
+
     function isWhitelisted(ip, whitelist) {
         if (!whitelist || whitelist.length === 0) return false
         for (const entry of whitelist) {
             if (!entry.enabled || !entry.ip) continue
             try {
-                if (new Netmask(entry.ip).contains(ip)) return true
+                const [network, prefix] = entry.ip.split('/')
+                const mask = prefix !== undefined
+                    ? (~0 << (32 - parseInt(prefix, 10))) >>> 0
+                    : 0xFFFFFFFF
+                if ((ipToInt(ip) & mask) === (ipToInt(network) & mask)) return true
             } catch (e) {
                 api.log('tarpit: invalid IP/CIDR in whitelist:', entry.ip, e.message)
             }
