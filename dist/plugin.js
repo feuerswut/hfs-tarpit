@@ -1,5 +1,5 @@
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
-exports.version = 5
+exports.version = 6
 exports.apiRequired = 12.97
 exports.author = "feuerswut"
 exports.repo = "feuerswut/hfs-tarpit"
@@ -141,8 +141,9 @@ exports.config = {
 }
 
 exports.init = api => {
-    const { _, misc } = api
+    const { _ } = api
     const { Readable, PassThrough } = require('stream')
+    const { Netmask } = api.require('netmask')
 
     // -------------------------------------------------------------------------
     // Stream pool — hard cap of 20 concurrent tarpit/honeypot streams.
@@ -231,9 +232,9 @@ exports.init = api => {
         for (const entry of whitelist) {
             if (!entry.enabled || !entry.ip) continue
             try {
-                if (misc.ipMatch(ip, entry.ip)) return true
+                if (new Netmask(entry.ip).contains(ip)) return true
             } catch (e) {
-                api.log('Invalid IP mask:', entry.ip, e.message)
+                api.log('tarpit: invalid IP/CIDR in whitelist:', entry.ip, e.message)
             }
         }
         return false
@@ -363,15 +364,15 @@ exports.init = api => {
     // -------------------------------------------------------------------------
     exports.middleware = ctx => {
         const config = {
-            enabled:         api.getConfig('enabled'),
-            speed:           api.getConfig('speed'),
-            honeypotSpeed:   api.getConfig('honeypotSpeed'),
-            honeypotDuration:api.getConfig('honeypotDuration'),
-            userAgentMasks:  api.getConfig('userAgentMasks'),
-            urlMasks:        api.getConfig('urlMasks'),
-            responseCodes:   api.getConfig('responseCodes'),
-            logMatches:      api.getConfig('logMatches'),
-            whitelistIPs:    api.getConfig('whitelistIPs')
+            enabled:          api.getConfig('enabled'),
+            speed:            api.getConfig('speed'),
+            honeypotSpeed:    api.getConfig('honeypotSpeed'),
+            honeypotDuration: api.getConfig('honeypotDuration'),
+            userAgentMasks:   api.getConfig('userAgentMasks'),
+            urlMasks:         api.getConfig('urlMasks'),
+            responseCodes:    api.getConfig('responseCodes'),
+            logMatches:       api.getConfig('logMatches'),
+            whitelistIPs:     api.getConfig('whitelistIPs')
         }
 
         if (!config.enabled) return
