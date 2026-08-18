@@ -2,7 +2,7 @@
 // This plugin will not receive further updates; only security-suite is maintained.
 
 exports.description = "Slow down responses for specific user agents, URLs, and response codes to deter bots and malicious crawlers"
-exports.version = 1.6
+exports.version = 3
 exports.apiRequired = 12.97
 exports.author = "feuerswut"
 exports.repo = "feuerswut/hfs-tarpit"
@@ -12,7 +12,7 @@ exports.config = {
         type: 'show_html',
         html: '<div style="background:#402020;border:1px solid #a33;border-radius:6px;padding:10px 14px;margin-bottom:1em">'
             + '<strong>Deprecated</strong> &mdash; this plugin has been merged into '
-            + '<a href="https://github.com/feuerswut/security-suite" target="_blank" rel="noopener">security-suite</a>. '
+            + '<a href="https://github.com/feuerswut/hfs-security-suite" target="_blank" rel="noopener">security-suite</a>. '
             + 'It will not receive further updates; only security-suite is maintained going forward.'
             + '</div>',
     },
